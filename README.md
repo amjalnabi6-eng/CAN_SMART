@@ -1,155 +1,92 @@
-import re
-import pandas as pd
-import os
-import glob
 
-# --- Tunable thresholds (edit here, not inside the logic) ---
-FREQ_SIGMA_MULTIPLIER = 3           # flag IDs above mean + Nσ
-PAYLOAD_VARIATION_LIMIT = 50        # flag IDs with more than N unique payloads
-CRITICAL_IDS = {'0C1': 4, '0C5': 4} # ID -> expected max number of states
-LOG_EXTENSION = "*.log"             # which files to scan in the directory
+Why this project exists
+Modern vehicles run on CAN, a serial bus designed in 1986 for reliability rather than security. CAN frames carry no authentication, no encryption, and no sender identity — any node on the bus can broadcast any ID, and every other node will accept it. This has led to public demonstrations of remote vehicle compromise (Miller & Valasek's 2015 Jeep Cherokee hack being the most famous).
+Most existing CAN IDS solutions are either:
 
+Closed-source commercial products (Karamba, GuardKnox, Argus) that researchers cannot inspect or reproduce, or
+Heavy machine-learning models that need large labelled attack datasets and produce unexplainable alerts.
 
-def analyze_file(input_path, output_dir):
-    """Analyze a single CAN log and write a per-file report.
-    Returns a short summary dict for the console overview."""
+This project takes the opposite approach: a ~150-line Python tool with three transparent statistical detectors that any researcher or student can run on any candump log without GPUs, training data, or hardware dependencies.
+Features
 
-    log_filename = os.path.basename(input_path)
-    report_name = f"intrusion_report_{os.path.splitext(log_filename)[0]}.txt"
-    output_path = os.path.join(output_dir, report_name)
+Three complementary detectors, each targeting a specific attack class
+Pure statistics, no ML — every threshold is a visible constant, every alert traces to a single rule
+Zero training data required — runs on day one against any candump log
+Batch mode — point it at a directory and get one report per file plus a summary
+Plain-text reports labelled by attack type — grep-able, version-controllable, printable
+~150 lines of Python, dependencies: pandas only
 
-    can_regex = re.compile(r'\((\d+\.\d+)\)\s+\w+\s+([0-9A-Fa-f]+)#([0-9A-Fa-f]+)')
+How it works
+The three detection methods
+MethodRuleCatchesSEC-01 — FrequencyAn ID's frame count exceeds mean + 3σ of the distributionDoS / flooding attacks where one ID dominates the busSEC-02 — Payload
+variationAn ID has more than 50 distinct payloadsInjection / fuzzing where an attacker sends randomized payloadsSEC-03 — State machineA monitored safety-critical ID exceeds 
+its expected state countSpoofing / replay where forged frames introduce invalid states
+All thresholds are named constants at the top of intrusion_scan.py:
+pythonFREQ_SIGMA_MULTIPLIER = 3                      # SEC-01 sensitivity
+PAYLOAD_VARIATION_LIMIT = 50                   # SEC-02 sensitivity
+CRITICAL_IDS = {'0C1': 4, '0C5': 4}            # SEC-03 watchlist (ID → max valid states)
+Installation
+Requires Python 3.8 or newer.
+bashgit clone https://github.com/<your-username>/can-bus-intrusion-detection.git
+cd can-bus-intrusion-detection
+pip install pandas
+Usage
+Single directory of logs
+Edit the bottom of intrusion_scan.py to point at your log directory, then run it:
+pythonTARGET_DIR = "/path/to/your/can/logs/"
+bashpython3 intrusion_scan.py
+Every .log file in the directory will be analyzed, and a report named intrusion_report_<logname>.txt will be written alongside each one.
+Capturing your own logs
+If you have access to a vehicle's CAN bus (or a CAN simulator), use Linux's can-utils:
+bashsudo apt install can-utils
+candump -L can0 > my_capture.log
+The -L flag produces exactly the format this tool expects: (timestamp) interface ID#payload.
+Example output
+Running the detector on a 215,669-frame log with three injected attacks:
+=== CAN BUS INTRUSION DETECTION REPORT ===
 
-    data = []
-    with open(input_path, 'r') as f:
-        for line in f:
-            match = can_regex.search(line)
-            if match:
-                timestamp, can_id, payload = match.groups()
-                data.append({
-                    'timestamp': float(timestamp),
-                    'id': can_id.upper(),
-                    'payload': payload.upper()
-                })
+[SEC-01] FREQUENCY ANALYSIS
+Attack Type : Denial of Service / Flooding
+Threshold   : mean + 3σ (12380 msgs)
+ ALERT: ID 7FF - 20000 msgs (247.5 msg/sec)
 
-    df = pd.DataFrame(data)
+[SEC-02] PAYLOAD VARIATION ANALYSIS
+Attack Type : Payload Injection / Fuzzing
+Threshold   : more than 50 unique payloads per ID
+ ALERT: ID 3A0 has 8500 unique payloads.
+ ALERT: ID 2A0 has 800 unique payloads.
+ ALERT: ID 0F1 has 644 unique payloads.
 
-    if df.empty:
-        print(f" [SKIP] {log_filename}: no valid CAN frames found.")
-        return {'file': log_filename, 'status': 'skipped', 'alerts': 0}
+[SEC-03] CRITICAL ID STATE CHECK
+Attack Type : Spoofing / Replay
+Monitoring  : 0C1, 0C5
+ WARNING: ID 0C1 state machine disrupted (7 states, expected <= 4).
+ OK: ID 0C5 stable with 4 states.
+The detector caught all three injected attacks (7FF, 2A0, 0C1) by the correct method.
+Validation
+The project includes augment_log.py, which takes a clean baseline capture and injects three documented attacks plus a false-positive trigger:
+Test caseIDExpectedResultDoS flood (20,000 frames in 5s)7FFSEC-01 alert✅ CaughtInjection (800 random payloads)2A0SEC-02 alert✅ Caught (exact count)Spoofing (3 forged states)0C1SEC-03 warning✅ Caught (7 states detected)Legitimate sensor (FP defence)3A0No SEC-01 alert✅ Passed (3σ holds)
+Threshold tuning
+The detector originally used mean + 2σ for SEC-01, which is the textbook default. On real vehicle traffic this generated 5 false positives because legitimate ECUs cycle at vastly different rates (10 ms vs 1 s), inflating standard deviation. Tightening to mean + 3σ:
+MetricBefore (2σ)After (3σ)Threshold~6,658 msgs12,380 msgsFalse positives on baseline50DoS attack detectionYesYes (still caught at 20,000)Sensor false-positive defenceFailedPassed
+The takeaway: threshold choice matters more than method choice. A simple rule tuned well outperforms a sophisticated rule tuned carelessly.
+Limitations & honest caveats
 
-    duration = df['timestamp'].max() - df['timestamp'].min()
+Offline analysis only. The current pipeline reads .log files. Real-time alerting on a live candump stream is future work.
+No ground-truth recall measurement. Validation uses controlled attack injection, not a labelled real-world attack dataset (those are scarce, vehicle-specific, and often classified).
+Critical-ID list is hand-curated. SEC-03 monitors 0C1 and 0C5 based on prior knowledge. Scaling to a full DBC requires automated extraction.
+SEC-02 cannot distinguish a fuzzer from a high-variance sensor. A legitimate temperature sensor producing thousands of unique values looks identical to a fuzzing attack at the variance level. This is a known statistical limitation, not a bug.
 
-    report = []
-    report.append("=== CAN BUS INTRUSION DETECTION REPORT ===")
-    report.append(f"Source File     : {input_path}")
-    report.append(f"Messages        : {len(df)}")
-    report.append(f"Capture Duration: {duration:.2f} seconds")
-    report.append(f"Unique IDs      : {df['id'].nunique()}")
-    report.append("-" * 50 + "\n")
+Future work
 
-    total_alerts = 0
-
-    # 1. Frequency Analysis -> DoS / Flooding
-    counts = df['id'].value_counts()
-    threshold = counts.mean() + (FREQ_SIGMA_MULTIPLIER * counts.std())
-    high_freq = counts[counts > threshold]
-
-    report.append("[SEC-01] FREQUENCY ANALYSIS")
-    report.append("Attack Type : Denial of Service / Flooding")
-    report.append(f"Threshold   : mean + {FREQ_SIGMA_MULTIPLIER}σ ({threshold:.0f} msgs)")
-    if high_freq.empty:
-        report.append(" OK: No flooding detected.")
-    else:
-        for can_id, count in high_freq.items():
-            rate = count / duration if duration > 0 else 0
-            report.append(f" ALERT: ID {can_id} - {count} msgs ({rate:.1f} msg/sec)")
-            total_alerts += 1
-    report.append("")
-
-    # 2. Payload Variation -> Injection / Fuzzing
-    variation = df.groupby('id')['payload'].nunique()
-    suspicious_var = variation[variation > PAYLOAD_VARIATION_LIMIT].sort_values(ascending=False)
-
-    report.append("[SEC-02] PAYLOAD VARIATION ANALYSIS")
-    report.append("Attack Type : Payload Injection / Fuzzing")
-    report.append(f"Threshold   : more than {PAYLOAD_VARIATION_LIMIT} unique payloads per ID")
-    if suspicious_var.empty:
-        report.append(" OK: No suspicious payload variation detected.")
-    else:
-        for can_id, var_count in suspicious_var.items():
-            report.append(f" ALERT: ID {can_id} has {var_count} unique payloads.")
-            total_alerts += 1
-    report.append("")
-
-    # 3. Critical ID State Check -> Spoofing / Replay
-    report.append("[SEC-03] CRITICAL ID STATE CHECK")
-    report.append("Attack Type : Spoofing / Replay")
-    report.append(f"Monitoring  : {', '.join(CRITICAL_IDS.keys())}")
-    for can_id, expected in CRITICAL_IDS.items():
-        if can_id in df['id'].values:
-            unique_states = df[df['id'] == can_id]['payload'].nunique()
-            if unique_states > expected:
-                report.append(f" WARNING: ID {can_id} state machine disrupted "
-                              f"({unique_states} states, expected <= {expected}).")
-                total_alerts += 1
-            else:
-                report.append(f" OK: ID {can_id} stable with {unique_states} states.")
-        else:
-            report.append(f" INFO: ID {can_id} not present in this log.")
-
-    report.append("")
-    report.append("=" * 50)
-    report.append("End of Report")
-
-    with open(output_path, 'w') as f:
-        f.write("\n".join(report))
-
-    print(f" [DONE] {log_filename}: {len(df)} msgs, {total_alerts} alert(s) -> {report_name}")
-    return {'file': log_filename, 'status': 'ok', 'alerts': total_alerts}
+Automated baseline learning — record a clean reference capture, store per-ID statistics, and flag deviations from each ID's own historical pattern (instead of a global threshold).
+Live-stream mode — wrap the parser around candump stdin for real-time alerting.
+DBC-driven SEC-03 — automatically build the critical-ID state table from a vehicle's DBC file.
+Entropy-based payload analysis — distinguish random fuzzing payloads (high entropy) from sensor readings (locally correlated) to remove the SEC-02 false positive.
 
 
-def scan_directory(directory_path):
-    """Scan every CAN log file in a directory and generate one report per file."""
+Acknowledgements
+Project developed at King Fahd University of Petroleum & Minerals, Department of Information & Computer Science, as part of the MX Project (2026).
 
-    if not os.path.isdir(directory_path):
-        print(f"Error: {directory_path} is not a valid directory.")
-        return
-
-    pattern = os.path.join(directory_path, LOG_EXTENSION)
-    log_files = sorted(glob.glob(pattern))
-
-    if not log_files:
-        print(f"No files matching '{LOG_EXTENSION}' found in {directory_path}")
-        return
-
-    print(f"Scanning {len(log_files)} file(s) in: {directory_path}")
-    print("-" * 60)
-
-    summary = []
-    for log_path in log_files:
-        try:
-            result = analyze_file(log_path, directory_path)
-            summary.append(result)
-        except Exception as e:
-            print(f" [FAIL] {os.path.basename(log_path)}: {e}")
-            summary.append({'file': os.path.basename(log_path), 'status': 'failed', 'alerts': 0})
-
-    # Console summary
-    print("-" * 60)
-    print("SCAN SUMMARY")
-    total_alerts = sum(r['alerts'] for r in summary)
-    ok_files = sum(1 for r in summary if r['status'] == 'ok')
-    print(f" Files processed : {ok_files}/{len(summary)}")
-    print(f" Total alerts    : {total_alerts}")
-    for r in summary:
-        flag = "!" if r['alerts'] > 0 else " "
-        print(f"  {flag} {r['file']:<35} {r['status']:<8} alerts={r['alerts']}")
-
-
-# SETTINGS: Update this to match your environment
-TARGET_DIR = "/home/claude/can_test/logs_dir/"
-
-if __name__ == "__main__":
-    scan_directory(TARGET_DIR)
-
+Author: Abdullah Alabbdrab Alnabi
+Mentor: Dr. Waleed Al-gobi
