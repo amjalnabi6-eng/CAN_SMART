@@ -1,0 +1,154 @@
+import re
+import pandas as pd
+import os
+import glob
+
+# --- Tunable thresholds (edit here, not inside the logic) ---
+FREQ_SIGMA_MULTIPLIER = 3           # flag IDs above mean + Nσ
+PAYLOAD_VARIATION_LIMIT = 50        # flag IDs with more than N unique payloads
+CRITICAL_IDS = {'0C1': 4, '0C5': 4} # ID -> expected max number of states
+LOG_EXTENSION = "*.log"             # which files to scan in the directory
+
+
+def analyze_file(input_path, output_dir):
+    """Analyze a single CAN log and write a per-file report.
+    Returns a short summary dict for the console overview."""
+
+    log_filename = os.path.basename(input_path)
+    report_name = f"intrusion_report_{os.path.splitext(log_filename)[0]}.txt"
+    output_path = os.path.join(output_dir, report_name)
+
+    can_regex = re.compile(r'\((\d+\.\d+)\)\s+\w+\s+([0-9A-Fa-f]+)#([0-9A-Fa-f]+)')
+
+    data = []
+    with open(input_path, 'r') as f:
+        for line in f:
+            match = can_regex.search(line)
+            if match:
+                timestamp, can_id, payload = match.groups()
+                data.append({
+                    'timestamp': float(timestamp),
+                    'id': can_id.upper(),
+                    'payload': payload.upper()
+                })
+
+    df = pd.DataFrame(data)
+
+    if df.empty:
+        print(f" [SKIP] {log_filename}: no valid CAN frames found.")
+        return {'file': log_filename, 'status': 'skipped', 'alerts': 0}
+
+    duration = df['timestamp'].max() - df['timestamp'].min()
+
+    report = []
+    report.append("=== CAN BUS INTRUSION DETECTION REPORT ===")
+    report.append(f"Source File     : {input_path}")
+    report.append(f"Messages        : {len(df)}")
+    report.append(f"Capture Duration: {duration:.2f} seconds")
+    report.append(f"Unique IDs      : {df['id'].nunique()}")
+    report.append("-" * 50 + "\n")
+
+    total_alerts = 0
+
+    # 1. Frequency Analysis -> DoS / Flooding
+    counts = df['id'].value_counts()
+    threshold = counts.mean() + (FREQ_SIGMA_MULTIPLIER * counts.std())
+    high_freq = counts[counts > threshold]
+
+    report.append("[SEC-01] FREQUENCY ANALYSIS")
+    report.append("Attack Type : Denial of Service / Flooding")
+    report.append(f"Threshold   : mean + {FREQ_SIGMA_MULTIPLIER}σ ({threshold:.0f} msgs)")
+    if high_freq.empty:
+        report.append(" OK: No flooding detected.")
+    else:
+        for can_id, count in high_freq.items():
+            rate = count / duration if duration > 0 else 0
+            report.append(f" ALERT: ID {can_id} - {count} msgs ({rate:.1f} msg/sec)")
+            total_alerts += 1
+    report.append("")
+
+    # 2. Payload Variation -> Injection / Fuzzing
+    variation = df.groupby('id')['payload'].nunique()
+    suspicious_var = variation[variation > PAYLOAD_VARIATION_LIMIT].sort_values(ascending=False)
+
+    report.append("[SEC-02] PAYLOAD VARIATION ANALYSIS")
+    report.append("Attack Type : Payload Injection / Fuzzing")
+    report.append(f"Threshold   : more than {PAYLOAD_VARIATION_LIMIT} unique payloads per ID")
+    if suspicious_var.empty:
+        report.append(" OK: No suspicious payload variation detected.")
+    else:
+        for can_id, var_count in suspicious_var.items():
+            report.append(f" ALERT: ID {can_id} has {var_count} unique payloads.")
+            total_alerts += 1
+    report.append("")
+
+    # 3. Critical ID State Check -> Spoofing / Replay
+    report.append("[SEC-03] CRITICAL ID STATE CHECK")
+    report.append("Attack Type : Spoofing / Replay")
+    report.append(f"Monitoring  : {', '.join(CRITICAL_IDS.keys())}")
+    for can_id, expected in CRITICAL_IDS.items():
+        if can_id in df['id'].values:
+            unique_states = df[df['id'] == can_id]['payload'].nunique()
+            if unique_states > expected:
+                report.append(f" WARNING: ID {can_id} state machine disrupted "
+                              f"({unique_states} states, expected <= {expected}).")
+                total_alerts += 1
+            else:
+                report.append(f" OK: ID {can_id} stable with {unique_states} states.")
+        else:
+            report.append(f" INFO: ID {can_id} not present in this log.")
+
+    report.append("")
+    report.append("=" * 50)
+    report.append("End of Report")
+
+    with open(output_path, 'w') as f:
+        f.write("\n".join(report))
+
+    print(f" [DONE] {log_filename}: {len(df)} msgs, {total_alerts} alert(s) -> {report_name}")
+    return {'file': log_filename, 'status': 'ok', 'alerts': total_alerts}
+
+
+def scan_directory(directory_path):
+    """Scan every CAN log file in a directory and generate one report per file."""
+
+    if not os.path.isdir(directory_path):
+        print(f"Error: {directory_path} is not a valid directory.")
+        return
+
+    pattern = os.path.join(directory_path, LOG_EXTENSION)
+    log_files = sorted(glob.glob(pattern))
+
+    if not log_files:
+        print(f"No files matching '{LOG_EXTENSION}' found in {directory_path}")
+        return
+
+    print(f"Scanning {len(log_files)} file(s) in: {directory_path}")
+    print("-" * 60)
+
+    summary = []
+    for log_path in log_files:
+        try:
+            result = analyze_file(log_path, directory_path)
+            summary.append(result)
+        except Exception as e:
+            print(f" [FAIL] {os.path.basename(log_path)}: {e}")
+            summary.append({'file': os.path.basename(log_path), 'status': 'failed', 'alerts': 0})
+
+    # Console summary
+    print("-" * 60)
+    print("SCAN SUMMARY")
+    total_alerts = sum(r['alerts'] for r in summary)
+    ok_files = sum(1 for r in summary if r['status'] == 'ok')
+    print(f" Files processed : {ok_files}/{len(summary)}")
+    print(f" Total alerts    : {total_alerts}")
+    for r in summary:
+        flag = "!" if r['alerts'] > 0 else " "
+        print(f"  {flag} {r['file']:<35} {r['status']:<8} alerts={r['alerts']}")
+
+
+# SETTINGS: Update this to match your environment
+TARGET_DIR = "/home/claude/can_test/logs_dir/"
+
+if __name__ == "__main__":
+    scan_directory(TARGET_DIR)
